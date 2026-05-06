@@ -1,0 +1,191 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+
+// 1. Merchants = Our D2C brand customers
+model Merchant {
+  id String @id @default(cuid())
+  name String
+  email String @unique
+  phone String
+  shopifyDomain String? // or Woocommerce/UniCommerce
+  shiprocketEmail String? // For API auth
+  shiprocketToken String? @db.Text
+  wabaPhoneNumberId String? // Meta WA Phone Number ID
+  wabaAccessToken String? @db.Text
+  plan Plan @default(STARTER)
+  orderLimit Int @default(1000)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders Order[]
+  waMessages WaMessage[]
+  rtoEvents RtoEvent[]
+  ndrTasks NdrTask[]
+
+  @@map("merchants")
+}
+
+enum Plan {
+  STARTER
+  GROWTH
+  SCALE
+  ENTERPRISE
+}
+
+// 2. Orders = Synced from Shopify/Shiprocket
+model Order {
+  id String @id @default(cuid())
+  merchantId String
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  // From store
+  shopifyOrderId String? @unique
+  orderNumber String // #1001
+  customerName String
+  customerPhone String
+  customerEmail String?
+  shippingAddress Json // Full address object
+  shippingPincode String @db.VarChar(10)
+  totalAmount Float
+  isCod Boolean @default(true)
+
+  // From Shiprocket
+  shiprocketOrderId String? @unique
+  awbCode String?
+  courierName String?
+  currentStatus String? // SHIPPED, NDR, DELIVERED, RTO
+  edd DateTime? // Expected delivery date
+
+  // Our logic
+  codConfirmStatus CodStatus @default(PENDING)
+  codConfirmedAt DateTime?
+  rtoRiskScore Int? // 0-100, calculated
+  rtoRiskReason String? // "Pincode 500001: 45% RTO history"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  waMessages WaMessage[]
+  rtoEvents RtoEvent[]
+  ndrTasks NdrTask[]
+
+  @@index([merchantId, currentStatus])
+  @@index([customerPhone])
+  @@index([shippingPincode])
+  @@map("orders")
+}
+
+enum CodStatus {
+  PENDING // WA sent, waiting for OTP
+  CONFIRMED // Customer clicked Yes
+  REJECTED // Customer clicked No
+  EXPIRED // No reply in 2hrs
+  CANCELLED // Auto-cancelled by us
+}
+
+// 3. WA Messages = All convos we send/receive
+model WaMessage {
+  id String @id @default(cuid())
+  merchantId String
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  orderId String?
+  order Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  wamid String @unique // Meta's message ID
+  direction Direction
+  messageType WaType // TEMPLATE, TEXT, BUTTON
+  templateName String? // cod_confirm_v1
+  content Json // Full WA payload
+  status String // sent, delivered, read, failed
+  timestamp DateTime @default(now())
+
+  @@index([merchantId, orderId])
+  @@map("wa_messages")
+}
+
+enum Direction {
+  OUTBOUND
+  INBOUND
+}
+
+enum WaType {
+  TEMPLATE
+  TEXT
+  BUTTON_REPLY
+  INTERACTIVE
+}
+
+// 4. RTO Events = When we save/lose money
+model RtoEvent {
+  id String @id @default(cuid())
+  merchantId String
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  orderId String
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  eventType RtoType
+  amountSaved Float // ₹ value. +ve = saved, -ve = lost to RTO
+  metadata Json? // "NDR attempt 2, customer rescheduled"
+  createdAt DateTime @default(now())
+
+  @@index([merchantId, createdAt])
+  @@map("rto_events")
+}
+
+enum RtoType {
+  COD_PREVENTED // Cancelled fake COD before shipping
+  NDR_RESCUED // Converted NDR → Delivered
+  RTO_OCCURRED // Failed, went back to warehouse
+  UPSELL_REVENUE // Money made from delivery upsell
+}
+
+// 5. NDR Tasks = AI voice call jobs
+model NdrTask {
+  id String @id @default(cuid())
+  merchantId String
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  orderId String
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  status NdrStatus @default(QUEUED)
+  attemptCount Int @default(0)
+  lastAttemptAt DateTime?
+  callSid String? // Exotel call ID
+  callStatus String? // completed, no-answer, busy
+  callRecordingUrl String? @db.Text
+  customerResponse String? // "Press 1: Reschedule, 2: Cancel"
+  nextAction String? // "Rescheduled to 2026-05-08"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, lastAttemptAt])
+  @@map("ndr_tasks")
+}
+
+enum NdrStatus {
+  QUEUED
+  CALLING
+  RESCHEDULED
+  CANCELLED
+  FAILED // No answer after 3 attempts
+  DELIVERED // Finally delivered after rescue
+}
+
+// 6. Fraud Pincode DB = Shared network data
+model FraudPincode {
+  pincode String @id @db.VarChar(10)
+  totalOrders Int @default(0)
+  totalRto Int @default(0)
+  rtoPercentage Float @default(0) // Calculated
+  lastUpdated DateTime @updatedAt
+  merchantCount Int @default(1) // How many merchants reported this
+
+  @@map("fraud_pincodes")
+}
